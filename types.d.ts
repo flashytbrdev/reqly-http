@@ -35,6 +35,11 @@ export interface Options {
   retryDelay?: number | ((attempt: number) => number);
   retryOn?: number[];
   retryNonIdempotent?: boolean;
+  signal?: AbortSignal;
+  socketPath?: string;
+  maxConcurrent?: number;
+  cache?: boolean | CacheStore;
+  throwHttpErrors?: boolean;
   forever?: boolean;
   keepAlive?: boolean;
   buffer?: boolean;
@@ -43,9 +48,12 @@ export interface Options {
   localAddress?: string;
   lookup?: (...args: any[]) => void;
   auth?: AuthOptions;
-  timeout?: number;
+  timeout?: number | TimeoutOptions;
+  hooks?: Hooks;
+  onUploadProgress?: ProgressCallback;
+  onDownloadProgress?: ProgressCallback;
   gzip?: boolean;
-  encoding?: BufferEncoding | null;
+  encoding?: BufferEncoding | (string & {}) | null;
   followRedirect?: boolean | ((res: IncomingMessage) => boolean);
   followAllRedirects?: boolean;
   maxRedirects?: number;
@@ -61,50 +69,110 @@ export interface Options {
   ciphers?: string;
 }
 
+export interface CacheEntry {
+  etag?: string;
+  lastModified?: string;
+  buf: Buffer;
+  headers: Record<string, any>;
+  statusCode: number;
+}
+
+export interface CacheStore {
+  get(key: string): CacheEntry | undefined | null;
+  set(key: string, value: CacheEntry): unknown;
+}
+
 export type FormValue =
   | string | number | boolean | Buffer | NodeJS.ReadableStream
-  | { value: string | number | boolean | Buffer | NodeJS.ReadableStream; options?: { filename?: string; contentType?: string } };
+  | { value: string | number | boolean | Buffer | NodeJS.ReadableStream; options?: { filename?: string; contentType?: string; knownLength?: number } };
 
 export interface Cookie {
   name: string; value: string; domain: string; hostOnly: boolean; path: string;
   expires: number | null; secure: boolean; httpOnly: boolean; created: number;
 }
 
+export interface JarData {
+  version: number;
+  cookies: Cookie[];
+}
+
 export declare class Jar {
   setCookie(cookie: string, uri: string | URL): boolean;
   getCookies(uri: string | URL): Cookie[];
   getCookieString(uri: string | URL): string;
+  toJSON(): JarData;
+  static fromJSON(data: string | JarData | Cookie[]): Jar;
   clear(): void;
+}
+
+export interface TimeoutOptions {
+  connect?: number;
+  response?: number;
+  total?: number;
+  idle?: number;
+}
+
+export interface Progress {
+  transferred: number;
+  total?: number;
+}
+
+export type ProgressCallback = (progress: Progress) => void;
+
+export interface RetryInfo {
+  request: Request;
+  attempt: number;
+  error?: Error;
+  response?: Response;
+  headers: Record<string, any>;
+}
+
+export type BeforeRequestHook = (request: Request) => void | Promise<void>;
+export type BeforeRetryHook = (info: RetryInfo) => void | Promise<void>;
+export type AfterResponseHook = (response: Response, request: Request) => void | Promise<void>;
+
+export interface Hooks {
+  beforeRequest?: BeforeRequestHook | BeforeRequestHook[];
+  beforeRetry?: BeforeRetryHook | BeforeRetryHook[];
+  afterResponse?: AfterResponseHook | AfterResponseHook[];
 }
 
 export interface Response<T = any> extends IncomingMessage {
   body: T;
+  fromCache?: boolean;
   request: Request;
+}
+
+export interface HTTPError extends Error {
+  code: 'EHTTP';
+  statusCode: number;
+  response: Response;
+  body: any;
 }
 
 export type Callback<T = any> = (error: Error | null, response: Response<T>, body: T) => void;
 
-export declare class Request extends EventEmitter implements PromiseLike<Response> {
+export declare class Request<T = any> extends EventEmitter implements PromiseLike<Response<T>> {
   options: Options;
   method: string;
   uri: URL;
   headers: Record<string, any>;
   redirects: Array<{ statusCode: number; redirectUri: string }>;
-  response?: Response;
-  then<R1 = Response, R2 = never>(
-    onfulfilled?: ((value: Response) => R1 | PromiseLike<R1>) | null,
+  response?: Response<T>;
+  then<R1 = Response<T>, R2 = never>(
+    onfulfilled?: ((value: Response<T>) => R1 | PromiseLike<R1>) | null,
     onrejected?: ((reason: any) => R2 | PromiseLike<R2>) | null
   ): Promise<R1 | R2>;
-  catch<R = never>(onrejected?: ((reason: any) => R | PromiseLike<R>) | null): Promise<Response | R>;
-  finally(onfinally?: (() => void) | null): Promise<Response>;
-  pipe<T extends Writable>(dest: T, options?: { end?: boolean }): T;
+  catch<R = never>(onrejected?: ((reason: any) => R | PromiseLike<R>) | null): Promise<Response<T> | R>;
+  finally(onfinally?: (() => void) | null): Promise<Response<T>>;
+  pipe<W extends Writable>(dest: W, options?: { end?: boolean }): W;
   abort(): void;
 }
 
 export interface Requester {
-  (uri: string | URL, options?: Options, callback?: Callback): Request;
-  (uri: string | URL, callback?: Callback): Request;
-  (options: Options, callback?: Callback): Request;
+  <T = any>(uri: string | URL, options?: Options, callback?: Callback<T>): Request<T>;
+  <T = any>(uri: string | URL, callback?: Callback<T>): Request<T>;
+  <T = any>(options: Options, callback?: Callback<T>): Request<T>;
   get: Requester;
   post: Requester;
   put: Requester;

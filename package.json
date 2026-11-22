@@ -1,7 +1,16 @@
 {
   "name": "reqly-http",
-  "version": "1.2.4",
+  "version": "1.3.0",
   "description": "Cliente HTTP moderno e sem dependências, com a API da antiga `request`: callback, stream, Promise, proxy, cookies, multipart e retry.",
+  "author": "flashytbr",
+  "homepage": "https://github.com/flashytbrdev/reqly-http#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flashytbrdev/reqly-http.git"
+  },
+  "bugs": {
+    "url": "https://github.com/flashytbrdev/reqly-http/issues"
+  },
   "main": "index.js",
   "module": "index.mjs",
   "types": "index.d.ts",
@@ -25,27 +34,15 @@
     "index.d.mts",
     "types.d.ts",
     "README.md",
+    "README.en.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/test.js && node test/esm.test.mjs",
+    "test": "node test/test.js && node test/esm.test.mjs && node test/v13.test.js && node test/v14.test.js",
     "test:real": "node test/real.js"
   },
-  "engines": {
-    "node": ">=14"
-  },
-  "keywords": [
-    "request",
-    "http",
-    "https",
-    "client",
-    "fetch",
-    "ajax",
-    "proxy",
-    "cookies",
-    "multipart",
-    "retry"
-  ],
+  "engines": { "node": ">=14" },
+  "keywords": ["request", "http", "https", "client", "fetch", "ajax", "proxy", "cookies", "multipart", "retry"],
   "license": "MIT"
 }

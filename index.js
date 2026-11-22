@@ -6,6 +6,8 @@ const tls = require('tls');
 const zlib = require('zlib');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
+const { Readable } = require('stream');
 const { EventEmitter } = require('events');
 
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
@@ -87,13 +89,140 @@ function mergeOptions(base, extra) {
   if (base.headers || extra.headers) {
     out.headers = { ...lowerHeaders(base.headers), ...lowerHeaders(extra.headers) };
   }
+  if (base.hooks || extra.hooks) out.hooks = mergeHooks(base.hooks, extra.hooks);
   return out;
+}
+
+function validLabel(label) {
+  if (typeof TextDecoder === 'undefined') return false;
+  try {
+    new TextDecoder(label);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function pickEncoding(o, res) {
   if (o.encoding !== undefined) return o.encoding;
-  const m = /charset=["']?([\w-]+)/i.exec(res.headers['content-type'] || '');
-  return (m && CHARSETS[m[1].toLowerCase()]) || 'utf8';
+  const m = /charset=["']?([\w.:-]+)/i.exec(res.headers['content-type'] || '');
+  if (!m) return 'utf8';
+  const label = m[1].toLowerCase();
+  return CHARSETS[label] || (validLabel(label) ? label : 'utf8');
+}
+
+function decodeBuffer(buf, enc) {
+  if (enc === null) return buf;
+  if (Buffer.isEncoding(enc)) return buf.toString(enc);
+  if (validLabel(enc)) return new TextDecoder(enc).decode(buf);
+  return buf.toString('utf8');
+}
+
+function retryAfterMs(res) {
+  const v = res && res.headers['retry-after'];
+  if (!v) return 0;
+  const secs = Number(v);
+  if (!isNaN(secs)) return secs > 0 ? secs * 1000 : 0;
+  const t = Date.parse(v);
+  return isNaN(t) ? 0 : Math.max(0, t - Date.now());
+}
+
+function timeouts(v) {
+  if (typeof v === 'number') return v > 0 ? { idle: v } : {};
+  if (!v || typeof v !== 'object') return {};
+  const out = {};
+  for (const k of ['connect', 'response', 'total', 'idle']) if (v[k] > 0) out[k] = v[k];
+  return out;
+}
+
+function hookList(hooks, name) {
+  const v = hooks && hooks[name];
+  return (Array.isArray(v) ? v : v ? [v] : []).filter((f) => typeof f === 'function');
+}
+
+function mergeHooks(a, b) {
+  const out = {};
+  for (const src of [a, b]) {
+    for (const k of Object.keys(src || {})) out[k] = (out[k] || []).concat(src[k]);
+  }
+  return out;
+}
+
+function sendBuffer(req, buf, onProgress) {
+  const total = buf.length;
+  const step = 65536;
+  let off = 0;
+  const next = () => {
+    while (off < total) {
+      if (req.destroyed) return;
+      const chunk = buf.subarray(off, Math.min(off + step, total));
+      off += chunk.length;
+      const sent = off;
+      const ok = req.write(chunk, (err) => {
+        if (!err) onProgress({ transferred: sent, total });
+      });
+      if (!ok) return req.once('drain', next);
+    }
+    req.end();
+  };
+  next();
+}
+
+const GLOBAL_CACHE_MAX = 100;
+const globalCache = new Map();
+const globalCacheStore = {
+  get: (k) => {
+    const v = globalCache.get(k);
+    if (v) {
+      globalCache.delete(k);
+      globalCache.set(k, v);
+    }
+    return v;
+  },
+  set: (k, v) => {
+    globalCache.delete(k);
+    globalCache.set(k, v);
+    if (globalCache.size > GLOBAL_CACHE_MAX) globalCache.delete(globalCache.keys().next().value);
+  }
+};
+
+function resolveCache(c) {
+  if (c === true) return globalCacheStore;
+  if (c && typeof c.get === 'function' && typeof c.set === 'function') return c;
+  return null;
+}
+
+const limiters = new Map();
+
+function acquireSlot(host, max, go) {
+  let lim = limiters.get(host);
+  if (!lim) {
+    lim = { active: 0, queue: [] };
+    limiters.set(host, lim);
+  }
+  const entry = { max, go, held: false };
+  const drain = () => {
+    while (lim.queue.length && lim.active < lim.queue[0].max) {
+      const next = lim.queue.shift();
+      next.held = true;
+      lim.active++;
+      next.go();
+    }
+    if (!lim.active && !lim.queue.length && limiters.get(host) === lim) limiters.delete(host);
+  };
+  entry.release = () => {
+    if (entry.held) {
+      entry.held = false;
+      lim.active--;
+    } else {
+      const i = lim.queue.indexOf(entry);
+      if (i >= 0) lim.queue.splice(i, 1);
+    }
+    drain();
+  };
+  lim.queue.push(entry);
+  drain();
+  return entry;
 }
 
 let shared;
@@ -166,6 +295,36 @@ class Jar {
     return this.getCookies(uri).map((c) => c.name + '=' + c.value).join('; ');
   }
 
+  toJSON() {
+    const now = Date.now();
+    return {
+      version: 1,
+      cookies: this._cookies.filter((c) => c.expires === null || c.expires > now).map((c) => ({ ...c }))
+    };
+  }
+
+  static fromJSON(data) {
+    const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+    const list = Array.isArray(parsed) ? parsed : parsed && parsed.cookies;
+    if (!Array.isArray(list)) throw new TypeError('Invalid cookie jar data');
+    const jar = new Jar();
+    for (const c of list) {
+      if (!c || typeof c.name !== 'string' || typeof c.domain !== 'string' || !c.domain) continue;
+      jar._cookies.push({
+        name: c.name,
+        value: String(c.value ?? ''),
+        domain: c.domain.toLowerCase(),
+        hostOnly: !!c.hostOnly,
+        path: typeof c.path === 'string' && c.path.startsWith('/') ? c.path : '/',
+        expires: typeof c.expires === 'number' ? c.expires : null,
+        secure: !!c.secure,
+        httpOnly: !!c.httpOnly,
+        created: typeof c.created === 'number' ? c.created : Date.now()
+      });
+    }
+    return jar;
+  }
+
   clear() { this._cookies = []; }
 }
 
@@ -176,19 +335,23 @@ function resolveJar(j) {
   return null;
 }
 
-function collectStream(s) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    s.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-    s.on('end', () => resolve(Buffer.concat(chunks)));
-    s.on('error', reject);
-  });
-}
-
 const quote = (s) => String(s).replace(/"/g, '%22').replace(/\r?\n/g, ' ');
 
+async function streamLength(stream, opts) {
+  if (typeof opts.knownLength === 'number') return opts.knownLength;
+  const wholeFile = (stream.start === undefined || stream.start === 0) &&
+    (stream.end === undefined || stream.end === Infinity);
+  if (stream.path && wholeFile && !stream.bytesRead) {
+    try {
+      const st = await fs.promises.stat(String(stream.path));
+      if (st.isFile()) return st.size;
+    } catch (_) {}
+  }
+  return undefined;
+}
+
 async function buildMultipart(formData, boundary) {
-  const out = [];
+  const parts = [];
   for (const [name, raw] of Object.entries(formData)) {
     for (const item of Array.isArray(raw) ? raw : [raw]) {
       if (item === undefined || item === null) continue;
@@ -200,12 +363,18 @@ async function buildMultipart(formData, boundary) {
       }
       let filename = opts.filename;
       let data;
+      let length;
       if (isStream(value)) {
         if (!filename && value.path) filename = path.basename(String(value.path));
-        data = await collectStream(value);
-      } else if (Buffer.isBuffer(value)) data = value;
-      else if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') data = Buffer.from(String(value));
-      else throw new TypeError('formData."' + name + '" must be string, number, Buffer, stream or {value, options}');
+        data = value;
+        length = await streamLength(value, opts);
+      } else if (Buffer.isBuffer(value)) {
+        data = value;
+        length = value.length;
+      } else if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+        data = Buffer.from(String(value));
+        length = data.length;
+      } else throw new TypeError('formData."' + name + '" must be string, number, Buffer, stream or {value, options}');
 
       let head = '--' + boundary + '\r\nContent-Disposition: form-data; name="' + quote(name) + '"';
       if (filename) head += '; filename="' + quote(filename) + '"';
@@ -213,11 +382,48 @@ async function buildMultipart(formData, boundary) {
       const ctype = opts.contentType ||
         (filename ? MIME[path.extname(filename).toLowerCase()] || 'application/octet-stream' : (Buffer.isBuffer(value) ? 'application/octet-stream' : null));
       if (ctype) head += 'Content-Type: ' + ctype + '\r\n';
-      out.push(Buffer.from(head + '\r\n'), data, Buffer.from('\r\n'));
+      parts.push({ head: Buffer.from(head + '\r\n'), data, length });
     }
   }
-  out.push(Buffer.from('--' + boundary + '--\r\n'));
-  return Buffer.concat(out);
+  const tail = Buffer.from('--' + boundary + '--\r\n');
+  const crlf = Buffer.from('\r\n');
+
+  if (!parts.some((p) => isStream(p.data))) {
+    const out = [];
+    for (const p of parts) out.push(p.head, p.data, crlf);
+    out.push(tail);
+    return Buffer.concat(out);
+  }
+
+  let total = tail.length;
+  for (const p of parts) {
+    if (p.length === undefined) {
+      total = undefined;
+      break;
+    }
+    total += p.head.length + p.length + crlf.length;
+  }
+
+  async function* generate() {
+    try {
+      for (const p of parts) {
+        yield p.head;
+        if (isStream(p.data)) {
+          for await (const chunk of p.data) yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        } else {
+          yield p.data;
+        }
+        yield crlf;
+      }
+      yield tail;
+    } finally {
+      for (const p of parts) if (isStream(p.data) && typeof p.data.destroy === 'function') p.data.destroy();
+    }
+  }
+
+  const body = Readable.from(generate(), { objectMode: false });
+  body._length = total;
+  return body;
 }
 
 const isLoopback = (h) => h === 'localhost' || h === '::1' || /^127\./.test(h);
@@ -307,6 +513,14 @@ class Request extends EventEmitter {
     this._attempt = 0;
     this._jar = resolveJar(opts.jar);
     this._jsonMode = opts.json !== undefined && opts.json !== false;
+    this._onSignalAbort = null;
+    this._totalTimer = null;
+    this._slot = null;
+    this._clearAttempt = null;
+    if (opts.signal && typeof opts.signal.addEventListener === 'function') {
+      this._onSignalAbort = () => this.abort();
+      opts.signal.addEventListener('abort', this._onSignalAbort, { once: true });
+    }
 
     try {
       this.uri = buildUrl(opts);
@@ -326,7 +540,7 @@ class Request extends EventEmitter {
     let payload = null;
 
     if (o.formData !== undefined) {
-      const boundary = '----HyperionBoundary' + crypto.randomBytes(12).toString('hex');
+      const boundary = '----ReqlyBoundary' + crypto.randomBytes(12).toString('hex');
       h['content-type'] = 'multipart/form-data; boundary=' + boundary;
       return buildMultipart(o.formData, boundary);
     }
@@ -346,14 +560,66 @@ class Request extends EventEmitter {
 
   _start() {
     if (this._finished) return;
-    Promise.resolve(this._payload).then((payload) => {
-      if (this._finished) return;
-      this._payload = payload;
-      const h = this.headers;
-      if (Buffer.isBuffer(payload)) h['content-length'] = String(payload.length);
-      else if (!payload && ['POST', 'PUT', 'PATCH'].includes(this.method)) h['content-length'] = '0';
-      this._request(this.uri, this.method, payload, h);
-    }, (err) => this._finish(err));
+    if (this.options.signal && this.options.signal.aborted) return this.abort();
+    const t = timeouts(this.options.timeout);
+    if (t.total) {
+      this._totalTimer = setTimeout(() => {
+        const err = new Error('ETIMEDOUT');
+        err.code = 'ETIMEDOUT';
+        err.phase = 'total';
+        this._kill(err);
+      }, t.total);
+    }
+    Promise.resolve(this._payload)
+      .then((payload) => {
+        if (this._finished) return;
+        this._payload = payload;
+        return this._runHooks('beforeRequest', [this]).then(() => {
+          if (this._finished) return;
+          const go = () => {
+            if (this._finished) return;
+            const h = this.headers;
+            if (Buffer.isBuffer(payload)) h['content-length'] = String(payload.length);
+            else if (payload && payload._length !== undefined && !h['content-length'] && !h['transfer-encoding']) {
+              h['content-length'] = String(payload._length);
+            } else if (!payload && ['POST', 'PUT', 'PATCH'].includes(this.method)) h['content-length'] = '0';
+            this._request(this.uri, this.method, payload, h);
+          };
+          const max = Number(this.options.maxConcurrent);
+          if (max > 0) {
+            this._slot = acquireSlot(this.uri.host, Math.floor(max) || 1, go);
+            if (this._finished) this._slot.release();
+          }
+          else go();
+        });
+      })
+      .catch((err) => {
+        if (this._finished) throw err;
+        this._finish(err);
+      });
+  }
+
+  _runHooks(name, args) {
+    let p = Promise.resolve();
+    for (const fn of hookList(this.options.hooks, name)) p = p.then(() => fn(...args));
+    return p;
+  }
+
+  _progress(fn) {
+    if (typeof fn !== 'function') return null;
+    return (p) => {
+      try {
+        fn(p);
+      } catch (e) {
+        this._kill(e);
+      }
+    };
+  }
+
+  _kill(err) {
+    this._finish(err);
+    if (this._req) this._req.destroy();
+    if (this.response) this.response.destroy();
   }
 
   _request(url, method, payload, headers) {
@@ -394,6 +660,7 @@ class Request extends EventEmitter {
       headers: h
     };
     for (const k of NET_KEYS) if (o[k] !== undefined) reqOpts[k] = o[k];
+    if (o.socketPath) reqOpts.socketPath = o.socketPath;
 
     const tlsOpts = {};
     if (isHttps) {
@@ -406,7 +673,7 @@ class Request extends EventEmitter {
     let agent = o.agent;
     if (!agent && (o.forever || o.keepAlive)) agent = sharedAgent(isHttps);
 
-    const proxy = resolveProxy(o, url);
+    const proxy = o.socketPath ? null : resolveProxy(o, url);
     if (proxy) {
       const ph = {};
       if (proxy.username || proxy.password) {
@@ -429,42 +696,93 @@ class Request extends EventEmitter {
     }
     if (agent) reqOpts.agent = agent;
 
+    const cache = method === 'GET' && !h.range ? resolveCache(o.cache) : null;
+    let cacheEntry = null;
+    if (cache) {
+      cacheEntry = cache.get(url.href) || null;
+      if (cacheEntry && !h['if-none-match'] && !h['if-modified-since']) {
+        if (cacheEntry.etag) h['if-none-match'] = cacheEntry.etag;
+        else if (cacheEntry.lastModified) h['if-modified-since'] = cacheEntry.lastModified;
+      } else {
+        cacheEntry = null;
+      }
+    }
+
+    const timers = [];
     const ctx = {
       url, method, payload, headers,
+      cache, cacheEntry, cacheable: !!cache && o.buffer !== false,
+      timer: (ms, fn) => {
+        const id = setTimeout(fn, ms);
+        timers.push(id);
+        return id;
+      },
+      clearTimers: () => {
+        timers.splice(0).forEach((id) => clearTimeout(id));
+      },
       canRetry: () =>
         !this._finished && this._attempt < (o.retries || 0) && !isStream(payload) &&
         (IDEMPOTENT.has(method) || !!o.retryNonIdempotent),
-      retry: (res) => {
+      retry: (res, err) => {
         this._attempt++;
         let delay = typeof o.retryDelay === 'function'
           ? o.retryDelay(this._attempt)
           : (o.retryDelay ?? 200) * 2 ** (this._attempt - 1);
-        const ra = res && Number(res.headers['retry-after']);
-        if (ra > 0) delay = Math.max(delay, Math.min(ra * 1000, 30000));
-        this.emit('retry', this._attempt, res);
+        const ra = retryAfterMs(res);
+        if (ra > 0) delay = Math.max(delay, Math.min(ra, 30000));
+        this.emit('retry', this._attempt, res, err);
         setTimeout(() => {
-          if (!this._finished) this._request(url, method, payload, headers);
+          if (this._finished) return;
+          const info = { request: this, attempt: this._attempt, error: err, response: res, headers };
+          this._runHooks('beforeRetry', [info]).then(() => {
+            if (!this._finished) this._request(url, method, payload, headers);
+          }, (e) => this._finish(e));
         }, delay);
       }
     };
+    this._clearAttempt = ctx.clearTimers;
 
     const req = lib.request(reqOpts, (res) => this._onResponse(res, ctx));
     req.on('error', (err) => {
-      if (RETRY_ERRORS.has(err.code) && ctx.canRetry()) return ctx.retry();
+      ctx.clearTimers();
+      if (RETRY_ERRORS.has(err.code) && ctx.canRetry()) return ctx.retry(undefined, err);
       this._finish(err);
     });
-    if (o.timeout) {
-      req.setTimeout(o.timeout, () => {
-        const err = new Error('ETIMEDOUT');
-        err.code = 'ETIMEDOUT';
-        req.destroy(err);
+
+    const t = timeouts(o.timeout);
+    const expire = (phase) => {
+      const err = new Error('ETIMEDOUT');
+      err.code = 'ETIMEDOUT';
+      err.phase = phase;
+      req.destroy(err);
+    };
+    if (t.idle) req.setTimeout(t.idle, () => expire('idle'));
+    if (t.connect) {
+      const timer = ctx.timer(t.connect, () => expire('connect'));
+      req.on('socket', (socket) => {
+        const ready = isHttps ? !!(socket.getProtocol && socket.getProtocol()) : !socket.connecting;
+        if (ready) return clearTimeout(timer);
+        socket.once(isHttps ? 'secureConnect' : 'connect', () => clearTimeout(timer));
       });
     }
+    if (t.response) req.on('finish', () => ctx.timer(t.response, () => expire('response')));
+
     this._req = req;
     this.emit('request', req);
+    const up = this._progress(o.onUploadProgress);
     if (isStream(payload)) {
       payload.on('error', (e) => req.destroy(e));
+      if (up) {
+        const total = Number(h['content-length']) || undefined;
+        let sent = 0;
+        payload.on('data', (c) => {
+          sent += c.length;
+          up({ transferred: sent, total });
+        });
+      }
       payload.pipe(req);
+    } else if (up && Buffer.isBuffer(payload) && payload.length) {
+      sendBuffer(req, payload, up);
     } else {
       req.end(payload || undefined);
     }
@@ -484,10 +802,13 @@ class Request extends EventEmitter {
     const o = this.options;
     const { url, method, payload, headers } = ctx;
     const status = res.statusCode;
+    ctx.clearTimers();
 
     if (this._jar && res.headers['set-cookie']) {
       for (const sc of [].concat(res.headers['set-cookie'])) this._jar.setCookie(sc, url);
     }
+
+    if (status === 304 && ctx.cacheEntry) return this._fromCache(res, ctx, ctx.cacheEntry);
 
     if ((o.retryOn || RETRY_STATUS).includes(status) && ctx.canRetry()) {
       res.resume();
@@ -513,7 +834,10 @@ class Request extends EventEmitter {
         delete nh['content-length'];
         delete nh['transfer-encoding'];
       }
-      if (next.host !== url.host) delete nh.authorization;
+      if (next.host !== url.host) {
+        delete nh.authorization;
+        delete nh.cookie;
+      }
       this.emit('redirect', res, next);
       return this._request(next, nm, np, nh);
     }
@@ -543,6 +867,8 @@ class Request extends EventEmitter {
 
     const buffering = o.buffer !== false && !(this._pipes.length && !this.callback && !this._promise);
     const limit = o.maxResponseSize;
+    const down = this._progress(o.onDownloadProgress);
+    const knownTotal = stream === res ? Number(res.headers['content-length']) || undefined : undefined;
     const chunks = [];
     let total = 0;
     stream.on('data', (c) => {
@@ -556,29 +882,88 @@ class Request extends EventEmitter {
       }
       this.emit('data', c);
       if (buffering) chunks.push(c);
+      if (down) down({ transferred: total, total: knownTotal });
     });
     stream.on('end', () => {
       this.emit('end');
-      let body;
-      if (!buffering) {
-        body = undefined;
-      } else if (method === 'HEAD') {
-        body = o.encoding === null ? Buffer.alloc(0) : '';
-      } else {
-        const buf = Buffer.concat(chunks);
-        const encoding = pickEncoding(o, res);
-        body = encoding === null ? buf : buf.toString(encoding);
-        if (this._jsonMode && typeof body === 'string' && body.length) {
-          try { body = JSON.parse(body.replace(/^\uFEFF/, ''), o.jsonReviver); } catch (_) {}
-        }
+      const buf = buffering ? Buffer.concat(chunks) : null;
+      if (buf && ctx.cacheable && status === 200 && !res.headers['set-cookie']) this._cacheStore(ctx, res, buf);
+      this._complete(res, buf, buffering, method);
+    });
+  }
+
+  _complete(res, buf, buffering, method) {
+    const o = this.options;
+    const status = res.statusCode;
+    let body;
+    if (!buffering) {
+      body = undefined;
+    } else if (method === 'HEAD') {
+      body = o.encoding === null ? Buffer.alloc(0) : '';
+    } else {
+      const encoding = pickEncoding(o, res);
+      try {
+        body = decodeBuffer(buf, encoding);
+      } catch (e) {
+        return this._finish(e, res);
+      }
+      if (this._jsonMode && typeof body === 'string' && body.length) {
+        try { body = JSON.parse(body.replace(/^\uFEFF/, ''), o.jsonReviver); } catch (_) {}
+      }
+    }
+    const settle = () => {
+      if (o.throwHttpErrors && status >= 400) {
+        const e = new Error('Request failed with status code ' + status);
+        e.code = 'EHTTP';
+        e.statusCode = status;
+        e.response = res;
+        e.body = body;
+        return this._finish(e, res, body);
       }
       this._finish(null, res, body);
-    });
+    };
+    if (!hookList(o.hooks, 'afterResponse').length) return settle();
+    res.body = body;
+    this._runHooks('afterResponse', [res, this]).then(() => {
+      body = res.body;
+      settle();
+    }, (e) => this._finish(e, res, body));
+  }
+
+  _cacheStore(ctx, res, buf) {
+    const etag = res.headers.etag;
+    const lastModified = res.headers['last-modified'];
+    if (!etag && !lastModified) return;
+    if (/\bno-store\b/i.test(String(res.headers['cache-control'] || ''))) return;
+    const keep = {};
+    for (const k of ['content-type', 'content-language', 'etag', 'last-modified', 'cache-control', 'expires']) {
+      if (res.headers[k] !== undefined) keep[k] = res.headers[k];
+    }
+    ctx.cache.set(ctx.url.href, { etag, lastModified, buf, headers: keep, statusCode: res.statusCode });
+  }
+
+  _fromCache(res, ctx, entry) {
+    res.resume();
+    res.statusCode = entry.statusCode;
+    res.headers = { ...res.headers, ...entry.headers };
+    res.fromCache = true;
+    res.request = this;
+    this.response = res;
+    this.emit('response', res);
+    const buffering = this.options.buffer !== false && !(this._pipes.length && !this.callback && !this._promise);
+    this.emit('data', entry.buf);
+    for (const d of this._pipes) d.end(entry.buf);
+    this.emit('end');
+    this._complete(res, buffering ? entry.buf : null, buffering, ctx.method);
   }
 
   _finish(err, res, body) {
     if (this._finished) return;
     this._finished = true;
+    clearTimeout(this._totalTimer);
+    if (this._slot) this._slot.release();
+    if (this._clearAttempt) this._clearAttempt();
+    if (this._onSignalAbort) this.options.signal.removeEventListener('abort', this._onSignalAbort);
     if (res) res.body = body;
     this._result = { err: err || null, res, body };
 
@@ -616,9 +1001,7 @@ class Request extends EventEmitter {
     if (this._finished) return;
     const err = new Error('Aborted');
     err.code = 'ABORTED';
-    this._finish(err);
-    if (this._req) this._req.destroy();
-    if (this.response) this.response.destroy();
+    this._kill(err);
     this.emit('abort');
   }
 }
