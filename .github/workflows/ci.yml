@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        node: [14, 16, 18, 20, 22]
+        include:
+          - { os: windows-latest, node: 20 }
+          - { os: macos-latest, node: 22 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
+
+  types:
+    name: Tipagem TypeScript (ESM + CJS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Typecheck
+        run: |
+          mkdir -p /tmp/tc/node_modules && cd /tmp/tc
+          npm init -y >/dev/null
+          npm i --silent typescript @types/node
+          ln -s "$GITHUB_WORKSPACE" node_modules/reqly-http
+          cat > a.mts <<'TS'
+          import request, { get, del, delete as del2, jar, Jar, type Options } from 'reqly-http';
+          const o: Options = { json: true, retries: 2, jar: jar() };
+          get('http://x', o); del('http://x'); del2('http://x'); new Jar(); request.get('http://x');
+          TS
+          cat > b.cts <<'TS'
+          import request = require('reqly-http');
+          request.get('http://x', { json: true }).pipe(process.stdout);
+          TS
+          echo '{"compilerOptions":{"module":"nodenext","moduleResolution":"nodenext","strict":true,"noEmit":true,"types":["node"]},"files":["a.mts","b.cts"]}' > tsconfig.json
+          npx tsc -p tsconfig.json
+
+  pack:
+    name: Conteúdo do pacote npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm pack --dry-run
+
+  real-api:
+    name: Testes contra APIs reais
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm run test:real
