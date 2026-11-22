@@ -1,6 +1,6 @@
 {
   "name": "reqly-http",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Cliente HTTP moderno e sem dependências, com a API da antiga `request`: callback, stream, Promise, proxy, cookies, multipart e retry.",
   "main": "index.js",
   "module": "index.mjs",
@@ -32,7 +32,20 @@
     "test": "node test/test.js && node test/esm.test.mjs",
     "test:real": "node test/real.js"
   },
-  "engines": { "node": ">=14" },
-  "keywords": ["request", "http", "https", "client", "fetch", "ajax", "proxy", "cookies", "multipart", "retry"],
+  "engines": {
+    "node": ">=14"
+  },
+  "keywords": [
+    "request",
+    "http",
+    "https",
+    "client",
+    "fetch",
+    "ajax",
+    "proxy",
+    "cookies",
+    "multipart",
+    "retry"
+  ],
   "license": "MIT"
 }
